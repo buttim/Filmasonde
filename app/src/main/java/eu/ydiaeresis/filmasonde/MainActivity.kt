@@ -55,7 +55,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
@@ -63,6 +62,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -75,18 +75,26 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.lifecycleScope
+import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
-import kotlinx.coroutines.CoroutineScope
+import eu.ydiaeresis.filmasonde.ui.theme.FilmasondeTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
 import kotlinx.io.bytestring.decodeToString
 import kotlinx.serialization.Serializable
@@ -96,22 +104,15 @@ import org.meshtastic.mqtt.MqttEndpoint
 import org.meshtastic.mqtt.use
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.pow
 import kotlin.math.sin
+import kotlin.math.sqrt
+import kotlin.time.Duration.Companion.milliseconds
 import androidx.camera.core.Preview as CamPreview
-import androidx.core.net.toUri
-import androidx.lifecycle.lifecycleScope
-import kotlin.math.*
-import eu.ydiaeresis.filmasonde.ui.theme.FilmasondeTheme
 
 // Container for Earth-Centered, Earth-Fixed 3D coordinates
 private data class EcefPoint(val x: Double, val y: Double, val z: Double)
 
-/**
- * Calculates the straight-line 3D Euclidean distance to another Location,
- * taking both curvature and altitude into account.
- *
- * @return Distance in meters.
- */
 fun Location.euclideanDistanceTo(other: Location): Double {
     val ecef1 = this.toEcef()
     val ecef2 = other.toEcef()
@@ -123,9 +124,6 @@ fun Location.euclideanDistanceTo(other: Location): Double {
     )
 }
 
-/**
- * Helper to convert standard Location data into ECEF Cartesian Coordinates (WGS-84)
- */
 private fun Location.toEcef(): EcefPoint {
     // WGS-84 Ellipsoid Constants
     val a = 6378137.0           // Semi-major axis (meters)
@@ -173,6 +171,35 @@ class MainActivity : ComponentActivity() {
     private var activeRecording: Recording? = null
     private val snackbarHostState = SnackbarHostState()
 
+    private var serial: String? = null
+
+    fun getLocationFlow(
+        fusedLocationClient: FusedLocationProviderClient,
+        locationRequest: LocationRequest
+    ) = callbackFlow {
+        val callback = object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) {
+                result.lastLocation?.let { trySend(it) }
+            }
+        }
+
+        try {
+            // Request ongoing background updates
+            fusedLocationClient.requestLocationUpdates(
+                locationRequest,
+                callback,
+                Looper.getMainLooper()
+            )
+        } catch (e: SecurityException) {
+            close(e) // Safely shut down flow if permissions are missing
+        }
+
+        // Automatically clears the GPS listener when the composable leaves the screen
+        awaitClose {
+            fusedLocationClient.removeLocationUpdates(callback)
+        }
+    }
+
     @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.RECORD_AUDIO])
     @Composable
     fun MainScreen(
@@ -191,7 +218,10 @@ class MainActivity : ComponentActivity() {
         var userLongitude by remember { mutableDoubleStateOf(0.0) }
         var userAltitude by remember { mutableDoubleStateOf(0.0) }
         var isTargetLoaded by remember { mutableStateOf(false) }
-        var serial by remember { mutableStateOf("") }
+        var noSonde by remember { mutableStateOf(false) }
+        var serial by remember { mutableStateOf("[no sonde]") }
+
+        var statusText by remember { mutableStateOf("Initializing") }
 
         // Moving Target States
         var targetLatitude by remember { mutableDoubleStateOf(0.0) }
@@ -235,26 +265,45 @@ class MainActivity : ComponentActivity() {
         }
 
         // 2. GPS LIVE STREAM CONTROL
-        DisposableEffect(hasLocationPermission) {
-            if (!hasLocationPermission) return@DisposableEffect onDispose {}
-
-            fusedLocationClient.lastLocation.addOnSuccessListener { location ->
-                if (location != null) {
-                    userLatitude = location.latitude
-                    userLongitude = location.longitude
-                    userAltitude = location.altitude
-                    if (!isTargetLoaded) {
-                        CoroutineScope(Dispatchers.IO).launch {
-                            val sonde = Sondehub.getNearbySonde(userLatitude, userLongitude)
+        LaunchedEffect(hasLocationPermission) {
+            if (!hasLocationPermission) return@LaunchedEffect
+            statusText = "Waiting for GPS..."
+            val locationRequest = LocationRequest.Builder(
+                Priority.PRIORITY_BALANCED_POWER_ACCURACY,
+                5000L // Check for updates every 5 seconds
+            ).build()
+            getLocationFlow(fusedLocationClient, locationRequest)
+                .flowOn(Dispatchers.IO)
+                .collect { location ->
+                    if (noSonde) return@collect
+                    try {
+                        statusText = "Searching for nearest sonde..."
+                        userLatitude = location.latitude
+                        userLongitude = location.longitude
+                        userAltitude = location.altitude
+                        if (!isLocationReady) {
+                            val sonde = Sondehub.getNearbySonde(
+                                userLatitude,
+                                userLongitude,
+                                maxDistance = 100000,
+                                maxSeconds = 0
+                            )
                             Log.i("MQTT", "Sonde: $sonde")
-                            if (sonde != null) {
-                                isTargetLoaded = true
+                            if (sonde == null) {
+                                noSonde = true
+                                statusText = "No nearby sonde. Please retry later"
+                            } else {
                                 serial = sonde.serial
+                                this@MainActivity.serial = serial
                                 targetLatitude = sonde.lat
                                 targetLongitude = sonde.lon
                                 targetAltitude = sonde.alt
+                                statusText = "Contacting Sondehub server..."
+                                delay(500.milliseconds)
+                                isTargetLoaded = true
                                 client.use(MqttEndpoint.parse("wss://ws-reader.v2.sondehub.org/")) { c ->
                                     Log.i("MQTT", "Connected")
+                                    statusText = ""
                                     c.subscribe("sondes/${sonde.serial}")
                                     c.messages.collect { msg ->
                                         Log.i(
@@ -274,45 +323,14 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             }
+                            isLocationReady = true
                         }
+                    } catch (e: Exception) {
+                        Log.e("GPS_Pipeline", "API Error on location shift", e)
+                        statusText = "Network sync failed."
                     }
-                    isLocationReady = true
                 }
-            }
-
-            val locationRequest =
-                LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 500L).build()
-            val locationCallback = object : LocationCallback() {
-                override fun onLocationResult(locationResult: LocationResult) {
-                    val lastLoc = locationResult.locations.lastOrNull() ?: return
-                    userLatitude = lastLoc.latitude
-                    userLongitude = lastLoc.longitude
-                    isLocationReady = true
-                }
-            }
-
-            fusedLocationClient.requestLocationUpdates(
-                locationRequest,
-                locationCallback,
-                context.mainLooper
-            )
-            onDispose { fusedLocationClient.removeLocationUpdates(locationCallback) }
         }
-
-        // 3. TARGET FLIGHT TRAJECTORY SIMULATION
-        /*LaunchedEffect(isLocationReady) {
-            if (!isLocationReady) return@LaunchedEffect
-            var runningTime = 0.0
-            while (true) {
-                delay(30.milliseconds) // ~33 FPS fluid execution
-                runningTime += 0.03
-
-                // Drone flies around your coordinate location in a dynamic orbit path
-                targetLatitude = 45.10522713611396//45.114160139306314//userLatitude + (0.0007 * sin(runningTime * 0.4))
-                targetLongitude = 6.717860543730171//7.454402796224682//userLongitude + (0.0009 * cos(runningTime * 0.2))
-                targetAltitude = 2310.0//1170.0//15.0 + (10.0 * sin(runningTime * 0.6))
-            }
-        }*/
 
         // --- SCREEN HUD RENDERING ---
         Box(modifier = Modifier.fillMaxSize()) {
@@ -325,7 +343,9 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.Center,
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Text("Permissions Required", fontWeight = FontWeight.Bold, fontSize = 22.sp)
+                    Text(resources.getString(R.string.app_name), fontWeight = FontWeight.Bold, fontSize = 40.sp)
+                    Spacer(modifier = Modifier.height(120.dp))
+                    Text("Permissions required", fontWeight = FontWeight.Bold, fontSize = 22.sp)
                     Spacer(modifier = Modifier.height(24.dp))
                     Button(onClick = onCameraPermissionRequest, enabled = !hasCameraPermission) {
                         Text(if (hasCameraPermission) "Camera Ready ✓" else "Grant Camera")
@@ -347,16 +367,6 @@ class MainActivity : ComponentActivity() {
                 }
             } else {
                 CameraPreview()
-                if (!isTargetLoaded) {
-                    Text(
-                        text = "?",
-                        fontSize = 90.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFFFFCC00), // Yellow
-                        modifier = Modifier.align(Alignment.Center) // Forces dead center alignment
-                    )
-                    return
-                }
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier.fillMaxSize()
@@ -367,13 +377,14 @@ class MainActivity : ComponentActivity() {
                         fontWeight = FontWeight.Bold,
                         color = Color.Green,
                         modifier = Modifier
-                            .padding(top = 30.dp)
+                            .padding(top = 40.dp)
                             .clickable {
                                 Log.i("INFO", "click su $serial")
                                 startActivity(Intent(Intent.ACTION_VIEW).setData("http://sondehub.org/$serial".toUri()))
                             }
                     )
-                    val distance = Location("manual").apply {
+                    val distance = if (userLatitude == 0.0 || userLongitude == 0.0 || targetLatitude==0.0 || targetLongitude==0.0) 0
+                    else Location("manual").apply {
                         latitude = userLatitude; longitude = userLongitude; altitude = userAltitude
                     }
                         .euclideanDistanceTo(Location("manual").apply {
@@ -382,9 +393,9 @@ class MainActivity : ComponentActivity() {
                         })
                         .toInt()
                     Text(
-                        "${distance}m",
+                        if (distance==0) "---" else if (distance > 5000) "%.1fkm".format(distance / 1000.0) else "${distance}m",
                         fontSize = 15.sp,
-                        color = Color.White,
+                        color = Color.Yellow,
                         modifier = Modifier.padding(top = 5.dp)
                     )
                 }
@@ -412,6 +423,25 @@ class MainActivity : ComponentActivity() {
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 48.dp) // Pushes it up slightly from the edge
                 )
+                if (!isTargetLoaded) {
+                    Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .clickable {}
+                            .background(Color.Black.copy(alpha = 0.7f))) {
+                        Text(
+                            text = statusText,
+                            fontSize = 30.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.Yellow,
+                            textAlign = TextAlign.Center,
+                            lineHeight = 40.sp,
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .padding(horizontal = 10.dp)
+                        )
+                    }
+                }
             }
         }
     }
@@ -492,23 +522,6 @@ class MainActivity : ComponentActivity() {
                             )
                         })
                 }
-            }
-        }
-    }
-
-    @Composable
-    fun LocationWaitOverlay(statusText: String) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.7f)),
-            contentAlignment = Alignment.Center
-        ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                CircularProgressIndicator(color = Color.Red)
-                Spacer(modifier = Modifier.height(16.dp))
-                // Display the live hardware state text here
-                Text(text = statusText, color = Color.White, fontSize = 16.sp)
             }
         }
     }
@@ -600,13 +613,6 @@ class MainActivity : ComponentActivity() {
         modifier: Modifier = Modifier
     ) {
         Box(modifier = modifier.fillMaxSize()) {
-            // Evaluate coordinates locally to manage the initialization state
-            val currentLat = userLatitude()
-            val currentLng = userLongitude()
-
-            if (currentLat == 0.0 && currentLng == 0.0) {
-                LocationWaitOverlay("Awaiting high-accuracy GPS fix and sensor calibration...")
-            } else {
                 Canvas(modifier = Modifier.fillMaxSize()) {
                     // Reading state lambdas strictly inside the Canvas block
                     // tells Compose to skip Recomposition entirely and only perform a Redraw.
@@ -616,141 +622,144 @@ class MainActivity : ComponentActivity() {
                     val tLat = targetLatitude()
                     val tLng = targetLongitude()
                     val tAlt = targetAltitude()
-                    val matrix = rotationMatrix()
 
-                    // 1. Local ENU coordinate transformation
-                    val latDelta = tLat - lat
-                    val lngDelta = tLng - lng
+                    if (lat != 0.0 && lng != 0.0 && tLat != 0.0 && tLng != 0.0) {
+                        val matrix = rotationMatrix()
 
-                    val targetNorth = latDelta * 111111.0
-                    val targetEast = lngDelta * 111111.0 * cos(Math.toRadians(lat))
-                    val targetUp = tAlt - alt
+                        // 1. Local ENU coordinate transformation
+                        val latDelta = tLat - lat
+                        val lngDelta = tLng - lng
 
-                    // 2. Local Space -> Device Camera Space Matrix Math
-                    val xDevice =
-                        (matrix[0] * targetEast + matrix[3] * targetNorth + matrix[6] * targetUp).toFloat()
-                    val yDevice =
-                        (matrix[1] * targetEast + matrix[4] * targetNorth + matrix[7] * targetUp).toFloat()
-                    val zDevice =
-                        (matrix[2] * targetEast + matrix[5] * targetNorth + matrix[8] * targetUp).toFloat()
+                        val targetNorth = latDelta * 111111.0
+                        val targetEast = lngDelta * 111111.0 * cos(Math.toRadians(lat))
+                        val targetUp = tAlt - alt
 
-                    val horizontalFov = Math.toRadians(60.0)
-                    val verticalFov = Math.toRadians(45.0)
-                    val forwardDistance = -zDevice
+                        // 2. Local Space -> Device Camera Space Matrix Math
+                        val xDevice =
+                            (matrix[0] * targetEast + matrix[3] * targetNorth + matrix[6] * targetUp).toFloat()
+                        val yDevice =
+                            (matrix[1] * targetEast + matrix[4] * targetNorth + matrix[7] * targetUp).toFloat()
+                        val zDevice =
+                            (matrix[2] * targetEast + matrix[5] * targetNorth + matrix[8] * targetUp).toFloat()
 
-                    val centerX = size.width / 2f
-                    val centerY = size.height / 2f
+                        val horizontalFov = Math.toRadians(60.0)
+                        val verticalFov = Math.toRadians(45.0)
+                        val forwardDistance = -zDevice
 
-                    val angleX = atan2(xDevice.toDouble(), forwardDistance.toDouble())
-                    val angleY = atan2(yDevice.toDouble(), forwardDistance.toDouble())
+                        val centerX = size.width / 2f
+                        val centerY = size.height / 2f
 
-                    val rectCenterX = centerX + ((angleX / horizontalFov).toFloat() * size.width)
-                    val rectCenterY = centerY - ((angleY / verticalFov).toFloat() * size.height)
+                        val angleX = atan2(xDevice.toDouble(), forwardDistance.toDouble())
+                        val angleY = atan2(yDevice.toDouble(), forwardDistance.toDouble())
 
-                    val isOnScreen = zDevice < 0 &&
-                            rectCenterX in 0f..size.width &&
-                            rectCenterY in 0f..size.height
+                        val rectCenterX =
+                            centerX + ((angleX / horizontalFov).toFloat() * size.width)
+                        val rectCenterY = centerY - ((angleY / verticalFov).toFloat() * size.height)
+
+                        val isOnScreen = zDevice < 0 &&
+                                rectCenterX in 0f..size.width &&
+                                rectCenterY in 0f..size.height
 
 // Inside SondeAROverlay's Canvas block, replace the 'if (isOnScreen)' block with this:
 
-                    if (isOnScreen) {
-                        // --- Define the FPV Style ---
-                        val targetColor = Color(0xFF00FFCC) // Keep that nice neon teal
-                        val totalSize = 75.dp.toPx()       // The boundary of the overall target
-                        val cornerLen = 18.dp.toPx()       // How long the L-shaped arms are
-                        val strokeW = 2.5.dp.toPx()        // Thin, sharp lines for a HUD look
+                        if (isOnScreen) {
+                            // --- Define the FPV Style ---
+                            val targetColor = Color(0xFF00FFCC) // Keep that nice neon teal
+                            val totalSize = 75.dp.toPx()       // The boundary of the overall target
+                            val cornerLen = 18.dp.toPx()       // How long the L-shaped arms are
+                            val strokeW = 2.5.dp.toPx()        // Thin, sharp lines for a HUD look
 
-                        // Calculate the bounding box based on totalSize
-                        val left = rectCenterX - totalSize / 2
-                        val top = rectCenterY - totalSize / 2
-                        val right = rectCenterX + totalSize / 2
-                        val bottom = rectCenterY + totalSize / 2
+                            // Calculate the bounding box based on totalSize
+                            val left = rectCenterX - totalSize / 2
+                            val top = rectCenterY - totalSize / 2
+                            val right = rectCenterX + totalSize / 2
+                            val bottom = rectCenterY + totalSize / 2
 
-                        // --- Draw the 4 Corners (FPV Style) ---
+                            // --- Draw the 4 Corners (FPV Style) ---
 
-                        // 1. Top-Left Corner
-                        drawLine(
-                            color = targetColor,
-                            start = Offset(left, top),
-                            end = Offset(left + cornerLen, top),
-                            strokeWidth = strokeW
-                        )
-                        drawLine(
-                            color = targetColor,
-                            start = Offset(left, top),
-                            end = Offset(left, top + cornerLen),
-                            strokeWidth = strokeW
-                        )
-
-                        // 2. Top-Right Corner
-                        drawLine(
-                            color = targetColor,
-                            start = Offset(right, top),
-                            end = Offset(right - cornerLen, top),
-                            strokeWidth = strokeW
-                        )
-                        drawLine(
-                            color = targetColor,
-                            start = Offset(right, top),
-                            end = Offset(right, top + cornerLen),
-                            strokeWidth = strokeW
-                        )
-
-                        // 3. Bottom-Left Corner
-                        drawLine(
-                            color = targetColor,
-                            start = Offset(left, bottom),
-                            end = Offset(left + cornerLen, bottom),
-                            strokeWidth = strokeW
-                        )
-                        drawLine(
-                            color = targetColor,
-                            start = Offset(left, bottom),
-                            end = Offset(left, bottom - cornerLen),
-                            strokeWidth = strokeW
-                        )
-
-                        // 4. Bottom-Right Corner
-                        drawLine(
-                            color = targetColor,
-                            start = Offset(right, bottom),
-                            end = Offset(right - cornerLen, bottom),
-                            strokeWidth = strokeW
-                        )
-                        drawLine(
-                            color = targetColor,
-                            start = Offset(right, bottom),
-                            end = Offset(right, bottom - cornerLen),
-                            strokeWidth = strokeW
-                        )
-
-                        // (Note: The drawCircle central dot has been removed as requested)
-
-                    } else {
-                        val screenAngle = if (zDevice < 0) atan2(
-                            -yDevice.toDouble(),
-                            xDevice.toDouble()
-                        ) else if (xDevice >= 0) 0.0 else Math.PI
-                        val arrowMargin = 45.dp.toPx()
-                        val arrowX = centerX + (centerX - arrowMargin) * cos(screenAngle).toFloat()
-                        val arrowY = centerY + (centerY - arrowMargin) * sin(screenAngle).toFloat()
-
-                        val arrowPath = Path().apply {
-                            moveTo(arrowX, arrowY)
-                            lineTo(
-                                arrowX - 16.dp.toPx() * cos(screenAngle - 0.4).toFloat(),
-                                arrowY - 16.dp.toPx() * sin(screenAngle - 0.4).toFloat()
+                            // 1. Top-Left Corner
+                            drawLine(
+                                color = targetColor,
+                                start = Offset(left, top),
+                                end = Offset(left + cornerLen, top),
+                                strokeWidth = strokeW
                             )
-                            lineTo(
-                                arrowX - 16.dp.toPx() * cos(screenAngle + 0.4).toFloat(),
-                                arrowY - 16.dp.toPx() * sin(screenAngle + 0.4).toFloat()
+                            drawLine(
+                                color = targetColor,
+                                start = Offset(left, top),
+                                end = Offset(left, top + cornerLen),
+                                strokeWidth = strokeW
                             )
-                            close()
+
+                            // 2. Top-Right Corner
+                            drawLine(
+                                color = targetColor,
+                                start = Offset(right, top),
+                                end = Offset(right - cornerLen, top),
+                                strokeWidth = strokeW
+                            )
+                            drawLine(
+                                color = targetColor,
+                                start = Offset(right, top),
+                                end = Offset(right, top + cornerLen),
+                                strokeWidth = strokeW
+                            )
+
+                            // 3. Bottom-Left Corner
+                            drawLine(
+                                color = targetColor,
+                                start = Offset(left, bottom),
+                                end = Offset(left + cornerLen, bottom),
+                                strokeWidth = strokeW
+                            )
+                            drawLine(
+                                color = targetColor,
+                                start = Offset(left, bottom),
+                                end = Offset(left, bottom - cornerLen),
+                                strokeWidth = strokeW
+                            )
+
+                            // 4. Bottom-Right Corner
+                            drawLine(
+                                color = targetColor,
+                                start = Offset(right, bottom),
+                                end = Offset(right - cornerLen, bottom),
+                                strokeWidth = strokeW
+                            )
+                            drawLine(
+                                color = targetColor,
+                                start = Offset(right, bottom),
+                                end = Offset(right, bottom - cornerLen),
+                                strokeWidth = strokeW
+                            )
+                        } else {
+                            val screenAngle = if (zDevice < 0) atan2(
+                                -yDevice.toDouble(),
+                                xDevice.toDouble()
+                            ) else if (xDevice >= 0) 0.0 else Math.PI
+                            val arrowMargin = 35.dp.toPx()
+                            val arrowX =
+                                centerX + (centerX - arrowMargin) * cos(screenAngle).toFloat()
+                            val arrowY =
+                                centerY + (centerY - arrowMargin) * sin(screenAngle).toFloat()
+
+                            val arrowPath = Path().apply {
+                                moveTo(arrowX, arrowY)
+                                val length = 32
+                                lineTo(
+                                    arrowX - length.dp.toPx() * cos(screenAngle - 0.4).toFloat(),
+                                    arrowY - length.dp.toPx() * sin(screenAngle - 0.4).toFloat()
+                                )
+                                lineTo(
+                                    arrowX - length.dp.toPx() * cos(screenAngle + 0.4).toFloat(),
+                                    arrowY - length.dp.toPx() * sin(screenAngle + 0.4).toFloat()
+                                )
+                                close()
+                            }
+                            drawPath(path = arrowPath, color = Color(0xFFFF3366))
                         }
-                        drawPath(path = arrowPath, color = Color(0xFFFF3366))
                     }
                 }
-            }
         }
     }
 
@@ -798,7 +807,7 @@ class MainActivity : ComponentActivity() {
         val recording = activeRecording
         if (recording != null) return // A recording is already active
 
-        val filename = "Filmasonde_${System.currentTimeMillis()}"
+        val filename = "${serial}_${System.currentTimeMillis()}"
         val contentValues = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
             put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")

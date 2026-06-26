@@ -1,26 +1,36 @@
 package eu.ydiaeresis.filmasonde
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.location.Location
+import android.os.Build
 import android.util.Log
-import io.ktor.client.*
-import io.ktor.client.engine.cio.*
-import io.ktor.client.request.*
-import io.ktor.client.statement.*
-import io.ktor.client.plugins.compression.*
+import androidx.core.content.pm.PackageInfoCompat
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.cio.CIO
+import io.ktor.client.plugins.UserAgent
+import io.ktor.client.plugins.compression.ContentEncoding
+import io.ktor.client.request.get
+import io.ktor.client.request.put
+import io.ktor.client.request.setBody
+import io.ktor.client.request.url
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
+import kotlinx.datetime.LocalDateTime
+import kotlinx.serialization.DeserializationStrategy
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.builtins.MapSerializer
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.MapSerializer
 import kotlinx.serialization.builtins.serializer
-import kotlinx.serialization.json.*
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNames
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import okhttp3.internal.platform.PlatformRegistry.applicationContext
 import org.json.JSONObject
-import kotlinx.datetime.LocalDateTime
-import io.ktor.client.plugins.UserAgent
-import kotlinx.serialization.DeserializationStrategy
 import kotlin.time.Clock
 import kotlin.time.DurationUnit
 import kotlin.time.ExperimentalTime
@@ -162,14 +172,85 @@ data class RecoveredSonde(
     }
 }
 
+data class AppVersion(
+    val versionName: String,
+    val versionNumber: Long,
+)
+
+fun getAppVersion(context: Context): AppVersion? {
+    return try {
+        val packageManager = context.packageManager
+        val packageName = context.packageName
+        val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
+        } else {
+            packageManager.getPackageInfo(packageName, 0)
+        }
+        AppVersion(
+            versionName = packageInfo.versionName ?: "",
+            versionNumber = PackageInfoCompat.getLongVersionCode(packageInfo),
+        )
+    } catch (e: Exception) {
+        Log.d("getAppVersion", e.toString())
+        null
+    }
+}
+
 @OptIn(ExperimentalSerializationApi::class, ExperimentalTime::class)
 abstract class Sondehub {
     companion object {
         const val URI = "https://api.v2.sondehub.org/"
-        private const val USER_AGENT =
-            "eu.ydiaeresis.trovalasonda 2.0.0.58"//BuildConfig.APPLICATION_ID + " " + BuildConfig.VERSION_NAME
         private val json1 = Json {
             ignoreUnknownKeys = true
+        }
+
+        fun getUserAgent(): String {
+            if (applicationContext==null) return "???"
+            val v = getAppVersion(applicationContext!!) ?: return "???"
+
+            return "${applicationContext!!.packageName} ${v.versionName}"
+        }
+
+        suspend fun <T> callAPI(
+            api: String,
+            ser: DeserializationStrategy<T>,
+            params: Map<String, Any>? = null
+        ): T? {
+            try {
+                HttpClient(CIO) {
+                    install(ContentEncoding) {
+                        gzip()
+                    }
+                    install(UserAgent) {
+                        agent = getUserAgent()
+                    }
+                }.use { http ->
+                    val response = http.get(URI + api) {
+                        url {
+                            params?.forEach { parameters.append(it.key, it.value.toString()) }
+                        }
+                    }
+                    return when (response.status) {
+                        HttpStatusCode.OK -> {
+                            Log.d("Sondehub", response.bodyAsText())
+                            json1.decodeFromString(
+                                ser, response.bodyAsText()
+                            )
+                        }
+
+                        else -> {
+                            Log.d(
+                                "Sondehub",
+                                "Error in callAPI($api): ${response.status} (${response.bodyAsText()})"
+                            )
+                            null
+                        }
+                    }
+                }
+            } catch (ex: Exception) {
+                Log.e("Sondehub", "Exception in callAPI($api): $ex")
+                return null
+            }
         }
 
         suspend fun getTrack(
@@ -233,7 +314,7 @@ abstract class Sondehub {
             try {
                 HttpClient(CIO) {
                     install(UserAgent) {
-                        agent = USER_AGENT
+                        agent = getUserAgent()
                     }
                 }.use {
                     val response = it.put {
@@ -322,43 +403,6 @@ abstract class Sondehub {
             )
         }
 
-
-        suspend fun <T> callAPI(
-            api: String,
-            ser: DeserializationStrategy<T>,
-            params: Map<String, Any>? = null
-        ): T? {
-            try {
-                HttpClient(CIO) {
-                    install(ContentEncoding) {
-                        gzip()
-                    }
-                    install(UserAgent) {
-                        agent = USER_AGENT
-                    }
-                }.use {
-                    val response = it.get(URI + api) {
-                        url {
-                            params?.forEach { parameters.append(it.key, it.value.toString()) }
-                        }
-                    }
-                    return when (response.status) {
-                        HttpStatusCode.OK -> {
-                            Log.d("Sondehub", response.bodyAsText())
-                            json1.decodeFromString(
-                                ser, response.bodyAsText()
-                            )
-                        }
-
-                        else -> null
-                    }
-                }
-            } catch (ex: Exception) {
-                Log.e("Sondehub", "Exception in callAPI($api): $ex")
-                return null
-            }
-        }
-
         suspend fun getRecovered(serial: String): RecoveredSonde? {
             val res = callAPI(
                 "recovered",
@@ -369,16 +413,19 @@ abstract class Sondehub {
         }
 
         //find most likely sonde type and frequency from current position
-        suspend fun getNearbySonde(lat: Double, lng: Double): Sonde? {
-            val maxDistance = 200000
-            val maxSeconds = 72000
+        suspend fun getNearbySonde(
+            lat: Double,
+            lng: Double,
+            maxDistance: Int = 200000,
+            maxSeconds: Int = 72000
+        ): Sonde? {
             val sondes = callAPI(
                 "sondes",
                 MapSerializer(String.serializer(), Sonde.serializer()),
                 mapOf(
                     "lat" to lat,
                     "lon" to lng,
-                    "maxDistance" to maxDistance,
+                    "distance" to maxDistance,
                     "last" to maxSeconds
                 )
             )

@@ -37,6 +37,7 @@ android {
 }
 
 dependencies {
+    implementation(libs.kotlinx.coroutines.play.services)
     implementation(libs.androidx.camera.effects)
     implementation(libs.androidx.compose.foundation)
     implementation(libs.androidx.compose.runtime)
