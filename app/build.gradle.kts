@@ -52,12 +52,11 @@ android {
     }
 }
 
-// 3. Register the task safely using the new class
 val incrementVersion = tasks.register<IncrementVersionTask>("incrementVersion") {
+    description = "incrementVersion"
     propertiesFile.set(rootProject.file("version.properties"))
 }
 
-// 4. Hook it to your release flows safely
 afterEvaluate {
     tasks.findByName("assembleRelease")?.finalizedBy(incrementVersion)
     tasks.findByName("bundleRelease")?.finalizedBy(incrementVersion)
@@ -105,8 +104,10 @@ android {
 }
 
 dependencies {
+    implementation(libs.androidx.compose.animation)
+    implementation(libs.ffmpeg.kit.free.x1)
+    implementation(libs.androidx.compose.material.icons.core)
     implementation(libs.androidx.compose.animation.core)
-    implementation(libs.androidx.ui.text)
     implementation(libs.lifecycle.viewmodel.compose)
     implementation(libs.kotlinx.coroutines.play.services)
     implementation(libs.androidx.camera.effects)

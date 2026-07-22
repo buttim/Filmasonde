@@ -1,12 +1,7 @@
 package eu.ydiaeresis.filmasonde
 
 import android.Manifest
-import android.net.Uri
-import android.os.Environment
-import androidx.core.content.FileProvider
-import java.io.File
 import android.annotation.SuppressLint
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -16,12 +11,12 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.location.Location
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.MediaStore
 import android.util.Log
 import android.view.Surface
 import android.view.WindowManager
@@ -36,7 +31,7 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.UseCaseGroup
 import androidx.camera.effects.OverlayEffect
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.video.MediaStoreOutputOptions
+import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
 import androidx.camera.video.Recorder
@@ -44,7 +39,15 @@ import androidx.camera.video.Recording
 import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -53,41 +56,65 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Snackbar
+import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableDoubleStateOf
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.ExperimentalTextApi
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextMotion
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
@@ -98,51 +125,63 @@ import eu.ydiaeresis.filmasonde.ui.theme.FilmasondeTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
 import kotlinx.io.bytestring.decodeToString
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNames
 import org.meshtastic.mqtt.MqttClient
 import org.meshtastic.mqtt.MqttEndpoint
 import org.meshtastic.mqtt.use
+import java.io.File
+import java.util.Locale
+import kotlin.math.atan
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.pow
 import kotlin.math.sin
 import kotlin.math.sqrt
+import kotlin.time.Clock
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Instant
 import androidx.camera.core.Preview as CamPreview
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.flow.Flow
-import androidx.lifecycle.viewmodel.compose.viewModel
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraManager
-import android.provider.DocumentsContract
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.text.ExperimentalTextApi
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.drawText
-import androidx.compose.ui.text.rememberTextMeasurer
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Constraints
-import androidx.compose.ui.unit.Dp
-import kotlin.math.atan
-import androidx.compose.material3.SnackbarDuration
-import androidx.compose.material3.SnackbarResult
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.ui.draw.rotate
-import kotlinx.coroutines.launch
+
+fun formatRecordingDuration(durationMs: Long): String {
+    val totalSeconds = durationMs / 1000
+    val seconds = totalSeconds % 60
+    val minutes = (totalSeconds / 60) % 60
+    val hours = totalSeconds / 3600
+
+    return if (hours > 0) {
+        String.format("%02d:%02d:%02d", hours, minutes, seconds)
+    } else {
+        String.format("%02d:%02d", minutes, seconds)
+    }
+}
+/**
+ * Returns true if the physical hardware device is currently oriented horizontally
+ * (Landscape or Reverse Landscape), independent of system auto-rotate lock.
+ */
+fun isDevicePhysicallyHorizontal(context: Context): Boolean {
+    val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+
+    // On Android 11 (API 30) and above, use context.display
+    val rotation = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+        context.display?.rotation ?: Surface.ROTATION_0
+    } else {
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.rotation
+    }
+
+    return rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270
+}
 
 data class CameraFov(val horizontal: Float, val vertical: Float)
 
@@ -255,11 +294,15 @@ private fun Location.toEcef(): EcefPoint {
 }
 
 @Serializable
-data class SondePosition(
+@OptIn(ExperimentalSerializationApi::class)
+data class SondePosition constructor(
     val frame: Int,
     val lat: Double,
     val lon: Double,
     val alt: Double,
+    //val datetime: Instant,
+    @JsonNames("time_received")
+    val timeReceived: Instant
 )
 
 class LocationViewModel : ViewModel() {
@@ -302,11 +345,41 @@ class LocationViewModel : ViewModel() {
 
     private var isTrackingStarted = false
 
+    private val _isRecording = MutableStateFlow(false)
+    val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
+
+    private val _recordingDurationMs = MutableStateFlow(0L)
+    val recordingDurationMs: StateFlow<Long> = _recordingDurationMs.asStateFlow()
+
+    /**
+     * Updates recording status. Resets timer to 0 when recording stops.
+     */
+    fun onRecordingStarted() {
+        _isRecording.value = true
+    }
+
+    /**
+     * Called continuously by CameraX VideoRecordEvent.Status
+     */
+    fun onRecordingDurationUpdated(durationMs: Long) {
+        _recordingDurationMs.value = durationMs
+        Log.d("REC", "Recording Duration: ${formatRecordingDuration(durationMs)}")
+    }
+
+    /**
+     * Called when recording stops or fails, resetting state and timer back to zero.
+     */
+    fun onRecordingFinalized() {
+        _isRecording.value = false
+        _recordingDurationMs.value = 0L
+    }
+
     @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION])
     fun startTracking(
         fusedLocationClient: FusedLocationProviderClient,
         locationRequest: LocationRequest,
-        onSerialAcquired: (String) -> Unit // Callback to update MainActivity.serial
+        onSerialAcquired: (String) -> Unit, // Callback to update MainActivity.serial
+        onNewTargetLocation: (Instant, Int, Double, Double, Double) -> Unit = { _, _, _, _, _ -> }
     ) {
         if (isTrackingStarted) return
         isTrackingStarted = true
@@ -328,8 +401,8 @@ class LocationViewModel : ViewModel() {
                             val sonde = Sondehub.getNearbySonde(
                                 userLatitude,
                                 userLongitude,
-                                maxDistance = 15_000_000,
-                                maxSeconds = 3600
+                                maxDistance = 50_000_000,
+                                maxSeconds = 0//3600
                             )
                             Log.i("MQTT", "Sonde: $sonde")
 
@@ -364,6 +437,13 @@ class LocationViewModel : ViewModel() {
                                             "MQTT",
                                             "lat: ${data.lat}, lon: ${data.lon}, alt: ${data.alt}"
                                         )
+                                        onNewTargetLocation(
+                                            data.timeReceived,
+                                            data.frame,
+                                            data.lat,
+                                            data.lon,
+                                            data.alt
+                                        )
 
                                         targetLatitude = data.lat
                                         targetLongitude = data.lon
@@ -375,7 +455,7 @@ class LocationViewModel : ViewModel() {
                         }
                     } catch (e: Exception) {
                         Log.e("GPS_Pipeline", "API Error on location shift", e)
-                        statusText = "Network sync failed."
+                        statusText = "Error accessing Sondehub. Retry later"
                     }
                 }
         }
@@ -383,46 +463,12 @@ class LocationViewModel : ViewModel() {
 }
 
 class MainActivity : ComponentActivity() {
-    val mqttJson = Json {
-        ignoreUnknownKeys = true // Prevents crashes if your broker adds new fields
-        coerceInputValues = true // Helps if, for example, a number is sent as a string
-    }
-    val client = MqttClient("TrovaLaSonda") {
-        keepAliveSeconds = 30
-        autoReconnect = true
-    }
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
     private val snackbarHostState = SnackbarHostState()
-
     private var serial: String? = null
-
-    fun getLocationFlow(
-        fusedLocationClient: FusedLocationProviderClient,
-        locationRequest: LocationRequest
-    ) = callbackFlow {
-        val callback = object : LocationCallback() {
-            override fun onLocationResult(result: LocationResult) {
-                result.lastLocation?.let { trySend(it) }
-            }
-        }
-
-        try {
-            // Request ongoing background updates
-            fusedLocationClient.requestLocationUpdates(
-                locationRequest,
-                callback,
-                Looper.getMainLooper()
-            )
-        } catch (e: SecurityException) {
-            close(e) // Safely shut down flow if permissions are missing
-        }
-
-        // Automatically clears the GPS listener when the composable leaves the screen
-        awaitClose {
-            fusedLocationClient.removeLocationUpdates(callback)
-        }
-    }
+    private var subBuilder: TelemetrySubtitleBuilder? = null
+    private var currentTempVideoFile: File? = null
 
     @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.RECORD_AUDIO])
     @Composable
@@ -432,14 +478,16 @@ class MainActivity : ComponentActivity() {
         hasRecordingAudioPermission: Boolean,
         onLocationPermissionRequest: () -> Unit,
         onRecordingAudioPermissionRequest: () -> Unit,
-        onCameraPermissionRequest: () -> Unit
+        onCameraPermissionRequest: () -> Unit,
+        viewModel: LocationViewModel = viewModel()
     ) {
-        val viewModel: LocationViewModel = viewModel()
         val context = LocalContext.current
         val realCameraFov = remember(context) { getCameraFieldOfView(context) }
 
         // Keep layout-only temporary states locally
-        var isRecording by remember { mutableStateOf(false) }
+        //var isRecording by remember { mutableStateOf(false) }
+        val isRecording by viewModel.isRecording.collectAsStateWithLifecycle()
+        val recordingDurationMs by viewModel.recordingDurationMs.collectAsStateWithLifecycle()
 
         // Initialized as an Identity Matrix so it never defaults to NaN or freezes on emulators.
         var rotationMatrix by remember {
@@ -449,6 +497,8 @@ class MainActivity : ComponentActivity() {
         val fusedLocationClient = remember {
             LocationServices.getFusedLocationProviderClient(context)
         }
+
+        var startRecordingTime = Instant.DISTANT_PAST
 
         // 1. COMPASS & ROTATION MATRIX LISTENER (Unchanged, operates on UI configuration)
         DisposableEffect(Unit) {
@@ -462,7 +512,7 @@ class MainActivity : ComponentActivity() {
                         SensorManager.getRotationMatrixFromVector(matrix, event.values)
 
                         val windowManager =
-                            context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                            context.getSystemService(WINDOW_SERVICE) as WindowManager
                         val displayRotation = windowManager.defaultDisplay.rotation
 
                         val remappedMatrix = FloatArray(9)
@@ -524,145 +574,218 @@ class MainActivity : ComponentActivity() {
                     5000L
                 ).build()
 
-                viewModel.startTracking(fusedLocationClient, locationRequest) { acquiredSerial ->
-                    // Still update your MainActivity reference safely
-                    this@MainActivity.serial = acquiredSerial
+                var lastFrame = 0
+                viewModel.startTracking(
+                    fusedLocationClient, locationRequest,
+                    onSerialAcquired = { acquiredSerial ->
+                        this@MainActivity.serial = acquiredSerial
+                    }
+                ) { timestamp, frame, lat, lon, alt ->
+                    if (isRecording && frame > lastFrame) {
+                        lastFrame = frame
+                        //TODO: check su timestamp
+                        val elapsedMilliseconds =
+                            timestamp.minus(startRecordingTime).inWholeMilliseconds
+                        if (subBuilder != null && elapsedMilliseconds > 0) {
+                            Log.d(
+                                "SUBS",
+                                "$timestamp: $frame, $lat, $lon, $alt ($elapsedMilliseconds)"
+                            )
+                            subBuilder!!.addFrame(
+                                elapsedMilliseconds,
+                                frame,
+                                lat,
+                                lon,
+                                alt
+                            )
+                        }
+                    }
                 }
             }
         }
 
         // --- SCREEN HUD RENDERING ---
-        Box(modifier = Modifier.fillMaxSize()) {
-            if (!hasLocationPermission || !hasCameraPermission || !hasRecordingAudioPermission) {
-                // Permission Guard Layout
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(32.dp),
-                    verticalArrangement = Arrangement.Center,
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(
-                        resources.getString(R.string.app_name),
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 40.sp
-                    )
-                    Spacer(modifier = Modifier.height(120.dp))
-                    Text("Permissions required", fontWeight = FontWeight.Bold, fontSize = 22.sp)
-                    Spacer(modifier = Modifier.height(24.dp))
-                    Button(onClick = onCameraPermissionRequest, enabled = !hasCameraPermission) {
-                        Text(if (hasCameraPermission) "Camera Ready ✓" else "Grant Camera")
-                    }
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Button(
-                        onClick = onRecordingAudioPermissionRequest,
-                        enabled = !hasRecordingAudioPermission
-                    ) {
-                        Text(if (hasRecordingAudioPermission) "Microphone Ready ✓" else "Grant Microphone")
-                    }
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Button(
-                        onClick = onLocationPermissionRequest,
-                        enabled = !hasLocationPermission
-                    ) {
-                        Text(if (hasLocationPermission) "Location Ready ✓" else "Grant Location")
-                    }
-                }
-            } else {
-                CameraPreview()
-                CompassRulerHUD(
-                    rotationMatrix = { rotationMatrix },
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 180.dp) // 💡 Pushed higher up to give breathing room above the button
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.fillMaxSize()
-                ) {
-                    Text(
-                        text = viewModel.serial, // Read from ViewModel
-                        fontSize = 30.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.Green,
-                        modifier = Modifier
-                            .padding(top = 40.dp)
-                            .clickable {
-                                Log.i("INFO", "click su ${viewModel.serial}")
-                                startActivity(Intent(Intent.ACTION_VIEW).setData("http://sondehub.org/${viewModel.serial}".toUri()))
+        @SuppressLint("UnusedMaterial3ScaffoldPaddingParameter")
+        Scaffold(
+            snackbarHost = {
+                SnackbarHost(hostState = snackbarHostState) { data ->
+                    Snackbar(
+                        modifier = Modifier.padding(12.dp),
+                        actionOnNewLine = true,
+                        // 1. Let the system handle the container color naturally based on theme
+                        action = {
+                            TextButton(onClick = { data.performAction() }) {
+                                Text(
+                                    text = data.visuals.actionLabel ?: "Open",
+                                    // 2. Uses your theme's high-visibility accent color for the primary action
+                                    color = MaterialTheme.colorScheme.inversePrimary,
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
-                    )
-
-                    // Read coordinate data dynamically from ViewModel
-                    val distance =
-                        if (viewModel.userLatitude == 0.0 || viewModel.userLongitude == 0.0 || viewModel.targetLatitude == 0.0 || viewModel.targetLongitude == 0.0) 0
-                        else Location("manual").apply {
-                            latitude = viewModel.userLatitude
-                            longitude = viewModel.userLongitude
-                            altitude = viewModel.userAltitude
+                        },
+                        dismissAction = {
+                            TextButton(onClick = { data.dismiss() }) {
+                                Text(
+                                    text = "Dismiss",
+                                    // 3. Uses the standard text color matching the container context
+                                    color = MaterialTheme.colorScheme.inverseOnSurface,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
                         }
-                            .euclideanDistanceTo(Location("manual").apply {
-                                latitude = viewModel.targetLatitude
-                                longitude = viewModel.targetLongitude
-                                altitude = viewModel.targetAltitude
-                            })
-                            .toInt()
-
-                    Text(
-                        if (distance == 0) "---" else if (distance > 5000) "%.1fkm / H:%.0fm".format(distance / 1000.0,viewModel.targetAltitude) else "${distance}m",
-                        fontSize = 15.sp,
-                        color = Color.Yellow,
-                        modifier = Modifier.padding(top = 5.dp)
-                    )
-                }
-
-                SondeAROverlay(
-                    userLatitude = { viewModel.userLatitude },
-                    userLongitude = { viewModel.userLongitude },
-                    userAltitude = { viewModel.userAltitude },
-                    targetLatitude = { viewModel.targetLatitude },
-                    targetLongitude = { viewModel.targetLongitude },
-                    targetAltitude = { viewModel.targetAltitude },
-                    rotationMatrix = { rotationMatrix },
-                    horizontalFov = realCameraFov.horizontal,
-                    verticalFov = realCameraFov.vertical,
-                    modifier = Modifier.fillMaxSize(),
-                )
-
-                RecordButton(
-                    isRecording = isRecording,
-                    onClick = {
-                        isRecording = !isRecording
-                        if (isRecording) {
-                            startRecordingVideo()
-                        } else {
-                            stopRecordingVideo()
-                        }
-                    },
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 48.dp)
-                )
-
-                if (!viewModel.isTargetLoaded) {
-                    Box(
-                        modifier = Modifier
-                            .matchParentSize()
-                            .clickable {}
-                            .background(Color.Black.copy(alpha = 0.7f))
                     ) {
                         Text(
-                            text = viewModel.statusText,
+                            text = data.visuals.message,
+                            // 4. Matches the container text standard profile automatically
+                            color = MaterialTheme.colorScheme.inverseOnSurface
+                        )
+                    }
+                }
+            }
+        ) { _ ->
+            Box(modifier = Modifier.fillMaxSize()) {
+                if (!hasLocationPermission || !hasCameraPermission || !hasRecordingAudioPermission) {
+                    // Permission Guard Layout
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(32.dp),
+                        verticalArrangement = Arrangement.Center,
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            resources.getString(R.string.app_name),
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 40.sp
+                        )
+                        Spacer(modifier = Modifier.height(120.dp))
+                        Text("Permissions required", fontWeight = FontWeight.Bold, fontSize = 22.sp)
+                        Spacer(modifier = Modifier.height(24.dp))
+                        Button(
+                            onClick = onCameraPermissionRequest,
+                            enabled = !hasCameraPermission
+                        ) {
+                            Text(if (hasCameraPermission) "Camera Ready ✓" else "Grant Camera")
+                        }
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Button(
+                            onClick = onRecordingAudioPermissionRequest,
+                            enabled = !hasRecordingAudioPermission
+                        ) {
+                            Text(if (hasRecordingAudioPermission) "Microphone Ready ✓" else "Grant Microphone")
+                        }
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Button(
+                            onClick = onLocationPermissionRequest,
+                            enabled = !hasLocationPermission
+                        ) {
+                            Text(if (hasLocationPermission) "Location Ready ✓" else "Grant Location")
+                        }
+                    }
+                } else {
+                    CameraPreview()
+                    CompassRulerHUD(
+                        rotationMatrix = { rotationMatrix },
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 180.dp) // 💡 Pushed higher up to give breathing room above the button
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        Text(
+                            text = viewModel.serial, // Read from ViewModel
                             fontSize = 30.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color.Yellow,
-                            textAlign = TextAlign.Center,
-                            lineHeight = 40.sp,
+                            color = Color.Green,
                             modifier = Modifier
-                                .align(Alignment.Center)
-                                .padding(horizontal = 10.dp)
+                                .padding(top = 40.dp)
+                                .clickable {
+                                    Log.i("INFO", "click su ${viewModel.serial}")
+                                    startActivity(Intent(Intent.ACTION_VIEW).setData("http://sondehub.org/${viewModel.serial}".toUri()))
+                                }
                         )
+
+                        // Read coordinate data dynamically from ViewModel
+                        val distance =
+                            if (viewModel.userLatitude == 0.0 || viewModel.userLongitude == 0.0 || viewModel.targetLatitude == 0.0 || viewModel.targetLongitude == 0.0) 0
+                            else Location("manual").apply {
+                                latitude = viewModel.userLatitude
+                                longitude = viewModel.userLongitude
+                                altitude = viewModel.userAltitude
+                            }
+                                .euclideanDistanceTo(Location("manual").apply {
+                                    latitude = viewModel.targetLatitude
+                                    longitude = viewModel.targetLongitude
+                                    altitude = viewModel.targetAltitude
+                                })
+                                .toInt()
+
+                        Text(
+                            if (distance == 0) "---" else if (distance > 5000) "%.1fkm / H:%.0fm".format(
+                                distance / 1000.0,
+                                viewModel.targetAltitude
+                            ) else "${distance}m",
+                            fontSize = 15.sp,
+                            color = Color.Yellow,
+                            modifier = Modifier.padding(top = 5.dp)
+                        )
+                    }
+
+                    SondeAROverlay(
+                        userLatitude = { viewModel.userLatitude },
+                        userLongitude = { viewModel.userLongitude },
+                        userAltitude = { viewModel.userAltitude },
+                        targetLatitude = { viewModel.targetLatitude },
+                        targetLongitude = { viewModel.targetLongitude },
+                        targetAltitude = { viewModel.targetAltitude },
+                        rotationMatrix = { rotationMatrix },
+                        horizontalFov = realCameraFov.horizontal,
+                        verticalFov = realCameraFov.vertical,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+
+                    RecordButtonContainer(
+                        isRecording = isRecording,
+                        recordingDurationMs = recordingDurationMs,
+                        onRecordClick = {
+                            if (!isRecording) {
+                                startRecordingTime = Clock.System.now()
+                                Log.d("SUBS", "Start recording: $startRecordingTime")
+                                startRecordingVideo(
+                                    latitude = viewModel.userLatitude,
+                                    longitude = viewModel.userLongitude,
+                                    isHorizontal = isDevicePhysicallyHorizontal(context),
+                                    viewModel
+                                )
+                            } else
+                                stopRecordingVideo()
+                        },
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter) // 💡 Locks it back to the bottom center
+                            .padding(bottom = 54.dp)
+                    )
+                    if (!viewModel.isTargetLoaded) {
+                        Box(
+                            modifier = Modifier
+                                .matchParentSize()
+                                .clickable {}
+                                .background(Color.Black.copy(alpha = 0.7f))
+                        ) {
+                            Text(
+                                text = viewModel.statusText,
+                                fontSize = 30.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.Yellow,
+                                textAlign = TextAlign.Center,
+                                lineHeight = 40.sp,
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .padding(horizontal = 10.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -729,7 +852,30 @@ class MainActivity : ComponentActivity() {
                 @SuppressLint("UnusedMaterial3ScaffoldPaddingParameter")
                 Scaffold(
                     modifier = Modifier.fillMaxSize(),
-                    snackbarHost = { SnackbarHost(snackbarHostState) }) { _ ->
+                    /*snackbarHost = {
+                        SnackbarHost(hostState = snackbarHostState) { data ->
+                            Snackbar(
+                                modifier = Modifier.padding(12.dp),
+                                action = {
+                                    TextButton(onClick = { data.performAction() }) {
+                                        Text(text = data.visuals.actionLabel ?: "Open", color = Color.Green)
+                                    }
+                                },
+                                dismissAction = {
+                                    IconButton(onClick = { data.dismiss() }) {
+                                        Icon(
+                                            imageVector = Icons.Default.Close,
+                                            contentDescription = "Dismiss",
+                                            tint = Color.White
+                                        )
+                                    }
+                                }
+                            ) {
+                                Text(text = data.visuals.message)
+                            }
+                        }
+                    }*/
+                ) { _ ->
                     MainScreen(
                         hasLocationPermission = hasLocationPermission,
                         hasRecordingAudioPermission = hasRecordingAudioPermission,
@@ -1163,7 +1309,10 @@ class MainActivity : ComponentActivity() {
             initialValue = 0f,
             targetValue = if (isRecording) 360f else 0f, // Only rotate up to 360 if recording
             animationSpec = infiniteRepeatable(
-                animation = tween(durationMillis = 2000, easing = LinearEasing) // 2 seconds per full rotation
+                animation = tween(
+                    durationMillis = 2000,
+                    easing = LinearEasing
+                ) // 2 seconds per full rotation
             ),
             label = "angle"
         )
@@ -1192,11 +1341,76 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @Composable
+    fun RecordButtonContainer(
+        isRecording: Boolean,
+        recordingDurationMs: Long,
+        onRecordClick: () -> Unit,
+        modifier: Modifier = Modifier
+    ) {
+        Box(
+            modifier = modifier.fillMaxWidth(),
+            contentAlignment = Alignment.Center
+        ) {
+            // 1. LEFT HALF CONTAINER (0.0 to 0.5 of screen width)
+            // Confines the timer badge to the left side so it CANNOT touch the button
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth(0.5f)
+                    .align(Alignment.CenterStart)
+                    // 48.dp = approx half button width (~36dp) + desired gap (~12dp)
+                    .padding(end = 48.dp),
+                contentAlignment = Alignment.CenterEnd
+            ) {
+                AnimatedVisibility(
+                    visible = isRecording,
+                    enter = fadeIn(),
+                    exit = fadeOut()
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier
+                            .background(
+                                color = Color.Black.copy(alpha = 0.65f),
+                                shape = RoundedCornerShape(20.dp)
+                            )
+                            .padding(horizontal = 16.dp, vertical = 8.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(10.dp)
+                                .background(Color.Red, shape = CircleShape)
+                        )
+                        Text(
+                            text = formatRecordingDuration(recordingDurationMs),
+                            color = Color.White,
+                            fontSize = 24.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace,
+                            style = TextStyle(
+                                fontFeatureSettings = "tnum",     // 1. Forces OpenType Tabular Numbers (equal digit widths)
+                                textMotion = TextMotion.Animated  // 2. Disables subpixel re-measurement jitter on fast updates
+                            )
+                        )
+                    }
+                }
+            }
+
+            // 2. RECORD BUTTON (Locked to the exact horizontal center of the screen)
+            RecordButton(
+                isRecording = isRecording,
+                onClick = onRecordClick
+            )
+        }
+    }
+
     fun openVideoFolder(context: Context) {
         // 1. Build an absolute SAF document pointer directly to the target directory
         // %3A represents the root separator (:), and %2F represents folder directory slashes (/)
-        val folderAuthorityPath = "content://com.android.externalstorage.documents/document/primary%3AMovies%2FFilmasonde"
-        val folderUri = Uri.parse(folderAuthorityPath)
+        val folderAuthorityPath =
+            "content://com.android.externalstorage.documents/document/primary%3AMovies%2FFilmasonde"
+        val folderUri = folderAuthorityPath.toUri()
 
         // 2. Intent built using ACTION_VIEW combined with standard document folder MIME targets
         val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -1222,50 +1436,99 @@ class MainActivity : ComponentActivity() {
     }
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
-    fun startRecordingVideo() {
+    fun startRecordingVideo(
+        latitude: Double? = null,
+        longitude: Double? = null,
+        isHorizontal: Boolean,
+        viewModel: LocationViewModel
+    ) {
         val recording = activeRecording
         if (recording != null) return // A recording is already active
 
-        val filename = "${serial}_${System.currentTimeMillis()}"
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
-            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-            if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
-                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Filmasonde")
-            }
+        subBuilder = TelemetrySubtitleBuilder()
+
+        // 1. Generate the single temporary file in cache and lock its reference locally
+        val tempFile = TelemetrySubtitleBuilder.createTempRecordingFile(this)
+        currentTempVideoFile = tempFile
+
+        videoCapture!!.targetRotation = if (isHorizontal) {
+            Surface.ROTATION_90
+        } else {
+            Surface.ROTATION_0
         }
-        // 2. Create the MediaStoreOutputOptions target container
-        val mediaStoreOutputOptions = MediaStoreOutputOptions
-            .Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-            .setContentValues(contentValues)
+        // 2. Setup FileOutputOptions targeting your private cache file
+        val fileOutputOptions = FileOutputOptions.Builder(tempFile)
+            .setLocation(Location("gps").apply {
+                this.latitude = latitude ?: 0.0
+                this.longitude = longitude ?: 0.0
+            })
             .build()
 
-        // 3. Setup the builder pipeline using your updated MediaStore targets
-        val recordingBuilder = videoCapture?.output?.prepareRecording(this, mediaStoreOutputOptions)
-        // Trigger capture configuration pipeline
+        // 3. Prepare the recording session using the FileOutputOptions
+        val recordingBuilder = videoCapture?.output?.prepareRecording(this, fileOutputOptions)
+
+        recordingBuilder?.withAudioEnabled()
+
         // 4. Start the recording stream
         activeRecording =
             recordingBuilder?.start(ContextCompat.getMainExecutor(this)) { recordEvent ->
                 when (recordEvent) {
                     is VideoRecordEvent.Start -> {
-                        Log.d("CameraX", "Public gallery recording started")
+                        Log.d("CameraX", "Temporary cache recording started")
+                        viewModel.onRecordingStarted()
                     }
+                    is VideoRecordEvent.Status -> {
+                        // Get accurate duration straight from the encoder (in nanoseconds)
+                        val durationNanos = recordEvent.recordingStats.recordedDurationNanos
+                        val durationMs = durationNanos / 1_000_000L
 
+                        // Update your ViewModel or Compose state with durationMs
+                        viewModel.onRecordingDurationUpdated(durationMs)
+                    }
                     is VideoRecordEvent.Finalize -> {
+                        viewModel.onRecordingFinalized()
                         if (!recordEvent.hasError()) {
-                            lifecycleScope.launch(Dispatchers.Main) {
-                                val result = snackbarHostState.showSnackbar(
-                                    message = "Video saved to Gallery!",
-                                    actionLabel = "Open folder",
-                                    duration = SnackbarDuration.Indefinite
-                                )
-                                if (result == SnackbarResult.ActionPerformed)
-                                    openVideoFolder(this@MainActivity)
+                            val actualVideoDurationMs: Long =
+                                recordEvent.recordingStats.recordedDurationNanos / 1_000_000
+                            // Get your generated in-memory subtitle string
+                            val inMemorySrt = subBuilder!!.build(actualVideoDurationMs)
+
+                            Log.d("SUBS", inMemorySrt)
+
+                            // Trigger the decoupled subtitle processing function using our locked file reference
+                            TelemetrySubtitleBuilder.finaliseVideoWithSubtitles(
+                                context = this@MainActivity,
+                                tempVideoFile = tempFile,
+                                inMemorySrtText = inMemorySrt
+                            ) { result ->
+                                // The processing is done! Switch back to Main thread for the UI
+                                lifecycleScope.launch(Dispatchers.Main) {
+                                    result.onSuccess { finalPublicFile ->
+                                        val snackbarResult = snackbarHostState.showSnackbar(
+                                            message = "Video saved to Gallery!",
+                                            actionLabel = "Open folder",
+                                            duration = SnackbarDuration.Indefinite
+                                        )
+                                        if (snackbarResult == SnackbarResult.ActionPerformed) {
+                                            openVideoFolder(this@MainActivity)
+                                        }
+                                    }.onFailure { exception ->
+                                        Log.e(
+                                            "CameraX",
+                                            "FFmpeg embedding failed: ${exception.localizedMessage}"
+                                        )
+                                    }
+                                }
                             }
                         } else {
                             Log.e("CameraX", "Recording error: ${recordEvent.error}")
+                            // Clean up cache file on an outright camera recording crash
+                            tempFile.delete()
                         }
+
+                        // Reset state references
                         activeRecording = null
+                        currentTempVideoFile = null
                     }
                 }
             }
@@ -1274,5 +1537,6 @@ class MainActivity : ComponentActivity() {
     fun stopRecordingVideo() {
         activeRecording?.stop()
         activeRecording = null
+        if (currentTempVideoFile == null) return
     }
 }

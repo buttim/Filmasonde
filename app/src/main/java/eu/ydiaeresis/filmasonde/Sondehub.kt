@@ -249,7 +249,8 @@ abstract class Sondehub {
                 }
             } catch (ex: Exception) {
                 Log.e("Sondehub", "Exception in callAPI($api): $ex")
-                return null
+                throw(ex)
+                //return null
             }
         }
 
